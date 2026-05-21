@@ -3,32 +3,36 @@
 ## Overview
 This project is a robust, concurrent C++ implementation of the MapReduce programming model. It provides a multi-threaded framework designed to process and generate large datasets efficiently by distributing tasks across multiple CPU threads.
 
-The framework abstracts the complex synchronization, thread pool management, and state tracking from the user, allowing developers to focus solely on implementing their custom `Map` and `Reduce` logic.
+The framework abstracts complex synchronization, thread pool management, and state tracking from the user, allowing developers to focus solely on implementing their custom `Map` and `Reduce` logic.
 
 ## Architecture & Workflow
-The MapReduce job executes in four strictly synchronized stages, managed autonomously by the framework:
+The MapReduce job executes in three strictly synchronized stages, managed autonomously by the framework:
 
-1. **Map Stage (`doMap`):** Each thread safely fetches an input pair and executes the client's map function, generating intermediate `(K2, V2)` pairs stored in thread-local vectors.
-2. **Shuffle Stage (`doShuffle`):** Thread 0 takes control, gathering all intermediate pairs from all threads, and organizing them into discrete batches grouped and sorted by identical keys.
-3. **Reduce Stage (`doReduce`):** Worker threads concurrently pull key-batches from the shuffled queue, applying the client's reduce function to generate the final `(K3, V3)` pairs.
-4. **Merge Stage (`doMerge`):** Thread 0 merges all localized output vectors into a single, cohesive, and sorted final output vector.
+1. **Map Stage:** Worker threads concurrently fetch input elements using atomic counters, execute the client's `map` function, and store intermediate `(K2, V2)` pairs in thread-local vectors.
+2. **Shuffle Stage:** Thread 0 consolidates all thread-local intermediate vectors, sorts them, and groups identical keys into discrete batches (`IntermediateVec`), pushing them into a shared queue.
+3. **Reduce Stage:** Worker threads concurrently pop key-batches from the shuffled queue, applying the client's `reduce` function to generate the final `(K3, V3)` pairs directly into thread-safe output partitions.
 
 ## Key Technical Features
-* **Advanced Concurrency Primitives:** Utilizes C++20 `std::barrier` to enforce phase synchronization without the overhead of heavy locking or condition variables.
+* **Modern C++ Synchronization:** Utilizes C++20 `std::barrier` to enforce phase synchronization across worker threads without the overhead of heavy locking or condition variables.
 * **Lock-Free State Tracking:** Implements a highly efficient 64-bit `std::atomic` tracker updated via low-level bitwise operations. This allows external clients to monitor job progression (Stage and Percentage) in real-time without blocking worker threads.
-* **Thread-Safety & Race Avoidance:** Designed with localized output vectors for each thread (`_intermediateVectors[threadId]`, `_outputVectors[threadId]`), significantly reducing the need for `std::mutex` locks during aggressive read/write cycles.
+* **Thread-Safety & Race Avoidance:** Designed with localized memory partitions for intermediate and output stages, significantly reducing the need for global `std::mutex` locks during aggressive read/write cycles.
 
 ## Usage Example
-To use the framework, inherit from the `MapReduceClient` class and override the `map` and `reduce` functions.
+To use the framework, inherit from the `MapReduceClient` class and override the `map` and `reduce` functions, then invoke the framework via the global controller function.
 
 ```cpp
-#include "MapReduceJob.h"
+#include "MapReduceFramework.h"
+#include <iostream>
 
 // 1. Define your custom Client
 class MyClient : public MapReduceClient {
 public:
-    void map(const std::shared_ptr<K1> key, const std::shared_ptr<V1> value, MapContext &context) const override { ... }
-    void reduce(const IntermediateVec &pairs, ReduceContext &context) const override { ... }
+    void map(const K1* key, const V1* value, MapContext& context) const override {
+        // Custom mapping logic
+    }
+    void reduce(const IntermediateVec* pairs, ReduceContext& context) const override {
+        // Custom reducing logic
+    }
 };
 
 int main() {
@@ -36,16 +40,20 @@ int main() {
     InputVec inputData = { ... };
     int threadCount = 4;
 
-    // 2. Start the Job
-    MapReduceJob job(client, inputData, threadCount);
+    // 2. Start the Job using the official global entrypoint
+    JobHandle handle = startMapReduceJob(client, inputData, threadCount);
 
     // 3. Monitor Progress (Optional)
-    while(!job.isDone()) {
-        MapReduceState state = job.getState();
-        std::cout << "Stage: " << state.stage << " | Completed: " << state.percentage << "%\n";
+    MapReduceState state;
+    getJobState(handle, &state);
+    while (state.stage != REDUCE_STAGE || state.percentage < 100.0) {
+        std::cout << "Stage: " << state.stage << " | Progress: " << state.percentage << "%\n";
+        getJobState(handle, &state);
     }
 
-    // 4. Retrieve Results
-    OutputVec results = job.getOutput();
+    // 4. Wait for completion and release resources
+    waitForJob(handle);
+    closeJobHandle(handle);
+    
     return 0;
 }
